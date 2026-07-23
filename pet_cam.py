@@ -3,6 +3,8 @@ import time
 import threading
 import os
 import glob
+import urllib.request
+from collections import deque
 from datetime import datetime
 from flask import Flask, Response, render_template_string, send_from_directory
 
@@ -17,7 +19,7 @@ Turns a Raspberry Pi 2B (dietpi) + one or more USB webcams into a pet monitor.
 - Web dashboard: start/stop stream, view live feeds, play/delete/download clips.
 - Old clips are deleted automatically (see RETENTION_DAYS).
 
-Run:      python3 waffle_cam_stream.py
+Run:      python3 pet_cam.py
 Open:     http://<raspberry-pi-ip>:5000/
 
 If using two cameras, set CAMERA_INDICES = [0, 1] below.
@@ -29,12 +31,35 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 FPS = 20.0
 MOTION_TIMEOUT = 3          # seconds of stillness before recording stops
-MOTION_THRESHOLD = 5000     # changed pixels needed to count as motion
+MOTION_THRESHOLD = 5000     # changed pixels needed to count as motion, tunable from the dashboard
+PREBUFFER_SECONDS = 2       # footage kept before motion so a clip leads into the action
 RETENTION_DAYS = 2          # delete clips older than this
 RECORDINGS_DIR = "."
+NTFY_TOPIC = ""             # ntfy.sh topic for a phone push on motion, "" disables it
 
 app = Flask(__name__)
 stream_enabled = False       # global: streaming on/off for all cameras
+
+
+def notify_motion(index):
+    """Run a phone push via ntfy.sh when a recording starts. no-op if NTFY_TOPIC is unset."""
+    if not NTFY_TOPIC:
+        return
+
+    def send():
+        try:
+            req = urllib.request.Request(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=f"Motion detected on cam {index}".encode(),
+                headers={"Title": "Waffle Cam", "Tags": "cat"},
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception as e:
+            # a network hiccup should never stall the capture loop.
+            print("Notify error:", e)
+
+    # send off-thread so the push request can't block frame capture.
+    threading.Thread(target=send, daemon=True).start()
 
 
 class Camera:
@@ -55,6 +80,8 @@ class Camera:
         self.recording = False
         self.writer = None
         self.last_motion_time = 0
+        self.last_changed = 0        # most recent changed-pixel count, shown on the dashboard
+        self.buffer = deque(maxlen=int(FPS * PREBUFFER_SECONDS))
         self.lock = threading.Lock()
 
         ok, first = self.cap.read()
@@ -87,13 +114,18 @@ class Camera:
         diff = cv2.absdiff(self.prev_gray, gray)
         thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)[1]
         self.prev_gray = gray
-        changed = cv2.countNonZero(thresh)
-        # frame-to-frame diff scales with speed, so a sprint spikes this far
-        # above a walk. watch these numbers to pick a MOTION_THRESHOLD that
-        # sits between the two for my camera distance.
-        if changed > 1000:
-            print(f"[cam{self.index}] changed pixels: {changed}")
-        return changed > MOTION_THRESHOLD
+        # frame-to-frame diff scales with speed, so a sprint spikes this far above a
+        # walk. the dashboard shows this live so I can park the threshold between them.
+        self.last_changed = cv2.countNonZero(thresh)
+        return self.last_changed > MOTION_THRESHOLD
+
+    def _stamp(self, frame, when):
+        # burn the capture time into a copy, the raw frame is shared with the stream.
+        stamped = frame.copy()
+        label = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(stamped, label, (10, self.height - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        return stamped
 
     def loop(self):
         """Capture, detect motion, and record. Runs until process is killed in a thread."""
@@ -103,20 +135,27 @@ class Camera:
                 time.sleep(0.1)
                 continue
 
+            now = time.time()
             with self.lock:
                 self.frame = frame
+            self.buffer.append((now, frame))   # rolling pre-motion window
 
             self.motion = self._detect_motion(frame)
 
             if self.motion:
-                self.last_motion_time = time.time()
+                self.last_motion_time = now
                 if not self.recording:
                     self.writer = self._open_writer()
                     self.recording = True
+                    notify_motion(self.index)
+                    # flush the buffer first so the clip leads into the action.
+                    for t, f in list(self.buffer):
+                        self.writer.write(self._stamp(f, t))
+                    continue
 
             if self.recording:
-                self.writer.write(frame)
-                if time.time() - self.last_motion_time > MOTION_TIMEOUT:
+                self.writer.write(self._stamp(frame, now))
+                if now - self.last_motion_time > MOTION_TIMEOUT:
                     self.writer.release()
                     self.recording = False
                     print(f"[cam{self.index}] stopped recording")
@@ -184,7 +223,13 @@ DASHBOARD = """
         }
         #start { background: #4CAF50; }
         #stop { background: #E53935; }
-        .feed { margin: 10px; max-width: 90%; }
+        .feed { margin: 10px; max-width: 90%; cursor: pointer; }
+        .feed.fs {
+            position: fixed; top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            margin: 0; max-width: none;
+            object-fit: contain; background: #000; z-index: 1000;
+        }
         a { color: #4FC3F7; }
     </style>
 </head>
@@ -193,12 +238,22 @@ DASHBOARD = """
     <button id="start" onclick="toggleStream('enable')">Start Stream</button>
     <button id="stop" onclick="toggleStream('disable')">Stop Stream</button>
 
+    <h2>Motion Sensitivity</h2>
+    <div id="tuning">
+        <input type="range" id="threshold" min="500" max="50000" step="250"
+               value="{{ threshold }}" oninput="setThreshold(this.value)" style="width:60%;">
+        <div>trigger above <span id="threshVal">{{ threshold }}</span> changed pixels</div>
+        <div id="live" style="margin-top:8px; color:#4FC3F7;"></div>
+    </div>
+
     <h2>Live Stream</h2>
     <div id="feeds">
         {% for i in indices %}
-            <img class="feed" id="feed{{ i }}" src="" width="640" alt="Camera {{ i }}">
+            <img class="feed" id="feed{{ i }}" src="" width="640" alt="Camera {{ i }}"
+                 onclick="toggleFullscreen(this)">
         {% endfor %}
     </div>
+    <p style="color:#888; font-size:14px;">Tap a live feed to toggle fullscreen.</p>
 
     <h2>Recordings</h2>
     <div id="recordings"></div>
@@ -215,6 +270,11 @@ function toggleStream(action) {
     });
 }
 
+// iphone safari won't fullscreen an <img>, so fake it with a full-viewport css class.
+function toggleFullscreen(el) {
+    el.classList.toggle('fs');
+}
+
 function loadRecordings() {
     fetch('/recordings').then(r => r.text())
         .then(html => { document.getElementById('recordings').innerHTML = html; });
@@ -225,6 +285,20 @@ function deleteRecording(name) {
     fetch('/delete/' + name).then(() => loadRecordings());
 }
 
+function setThreshold(v) {
+    document.getElementById('threshVal').textContent = v;
+    fetch('/threshold/' + v);
+}
+
+function pollStatus() {
+    fetch('/status').then(r => r.json()).then(s => {
+        document.getElementById('live').innerHTML =
+            CAMERAS.map(i => 'cam ' + i + ': ' + s.cameras[i] + ' changed pixels').join('<br>');
+    });
+}
+setInterval(pollStatus, 500);
+pollStatus();
+
 loadRecordings();
 </script>
 </body>
@@ -234,7 +308,23 @@ loadRecordings();
 
 @app.route("/")
 def dashboard():
-    return render_template_string(DASHBOARD, indices=list(cameras))
+    return render_template_string(DASHBOARD, indices=list(cameras), threshold=MOTION_THRESHOLD)
+
+
+@app.route("/status")
+def status():
+    # live changed-pixel counts so the dashboard can show motion while I tune the threshold.
+    return {
+        "threshold": MOTION_THRESHOLD,
+        "cameras": {i: cam.last_changed for i, cam in cameras.items()},
+    }
+
+
+@app.route("/threshold/<int:value>")
+def set_threshold(value):
+    global MOTION_THRESHOLD
+    MOTION_THRESHOLD = value
+    return "OK"
 
 
 @app.route("/enable")
@@ -279,6 +369,10 @@ def recordings():
                     style="background:#E53935;color:#fff;padding:8px 15px;border:none;border-radius:5px;margin-top:5px;">
                 Delete
             </button>
+            <a href="/download/{f}" download
+               style="display:inline-block;background:#4FC3F7;color:#000;padding:8px 15px;border-radius:5px;margin-top:5px;text-decoration:none;">
+                Download
+            </a>
         </li>""")
     return "<ul style='padding:0;'>" + "".join(items) + "</ul>"
 
